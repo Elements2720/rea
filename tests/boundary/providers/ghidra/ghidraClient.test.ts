@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
-import { access, chmod, mkdir, writeFile } from "node:fs/promises";
+import { access, chmod, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
 import { PassThrough } from "node:stream";
 
@@ -17,6 +17,7 @@ import { GhidraClient } from "../../../../src/ghidra/GhidraClient.js";
 import { ProviderRunLineage } from "../../../../src/process/ProviderRunLineage.js";
 import { PrivateRuntimeRoot } from "../../../../src/process/PrivateRuntimeRoot.js";
 import { OwnedFileHandle } from "../../../../src/filesystem/OwnedFileHandle.js";
+import * as regularFile from "../../../../src/filesystem/RegularFile.js";
 import { GHIDRA_PROCESS_DIAGNOSTIC_BYTES } from "../../../../src/ghidra/GhidraDiagnostics.js";
 import {
   GhidraHeadlessLauncher,
@@ -106,6 +107,7 @@ const clientFor = (
   options: {
     readonly startupTimeoutMs?: number;
     readonly onDiagnostic?: (event: GhidraDiagnostic) => void;
+    readonly platform?: NodeJS.Platform;
     readonly transport?: GhidraTransportKind;
     readonly runId?: string;
     readonly logger?: Logger;
@@ -117,6 +119,7 @@ const clientFor = (
     launcher,
     targetPath: options.targetPath ?? fixturePath,
     targetSha256: options.targetSha256 ?? TARGET_SHA256,
+    platform: options.platform ?? process.platform,
     transport: options.transport ?? HOST_TRANSPORT,
     providerVersion: PROVIDER_VERSION,
     profileDigest: PROFILE_DIGEST,
@@ -130,6 +133,33 @@ const clientFor = (
   clients.push(client);
   return client;
 };
+
+const mockTcpEndpointObservation = () =>
+  vi
+    .spyOn(GhidraTransport, "observeGhidraEndpoint")
+    .mockImplementation(async (endpoint) => {
+      if (endpoint.transport !== "authenticated-loopback-tcp") return ok(null);
+      try {
+        const encoded = await readFile(endpoint.path, "utf8");
+        const parsed: unknown = JSON.parse(encoded);
+        if (
+          typeof parsed !== "object" ||
+          parsed === null ||
+          !("port" in parsed) ||
+          typeof parsed.port !== "number"
+        )
+          return ok(null);
+        return ok({ host: "127.0.0.1" as const, port: parsed.port });
+      } catch (cause: unknown) {
+        if (
+          cause instanceof Error &&
+          "code" in cause &&
+          cause.code === "ENOENT"
+        )
+          return ok(null);
+        throw cause;
+      }
+    });
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -232,8 +262,13 @@ it("keeps one shared startup despite a failed progress sink and stops reports af
 });
 
 describe("GhidraClient captured source snapshot", () => {
-  it("retains a snapshot descriptor whose close failed until session cleanup succeeds", async () => {
-    const client = clientFor(new FixtureLauncher());
+  it("retains snapshot cleanup and completed facts after close failure (#4752)", async () => {
+    const endpointObservation = mockTcpEndpointObservation();
+    onTestFinished(() => endpointObservation.mockRestore());
+    const client = clientFor(new FixtureLauncher(), {
+      platform: "darwin",
+      transport: "authenticated-loopback-tcp",
+    });
     const started = await client.start();
     if (!started.ok) throw started.error;
     const close = vi
@@ -241,10 +276,23 @@ describe("GhidraClient captured source snapshot", () => {
       .mockRejectedValueOnce(new Error("snapshot descriptor close failed"))
       .mockRejectedValueOnce(new Error("snapshot descriptor close failed"));
     try {
-      await expect(client.hashTargetSnapshot()).resolves.toMatchObject({
+      const result = await client.hashTargetSnapshot();
+      expect(result).toMatchObject({
         ok: false,
-        error: { kind: "protocol" },
+        error: {
+          kind: "protocol",
+          cleanupFailure: { cleanupIncomplete: true },
+          cause: {
+            fileCleanupFailure: {
+              outcome: {
+                kind: "completed",
+                value: { sha256: TARGET_SHA256 },
+              },
+            },
+          },
+        },
       });
+      if (result.ok) throw new Error("Expected snapshot cleanup failure");
       const owner = close.mock.contexts[0];
       expect(owner).toBeInstanceOf(OwnedFileHandle);
       await expect(client.close()).resolves.toMatchObject({
@@ -256,6 +304,7 @@ describe("GhidraClient captured source snapshot", () => {
       });
       const closed = await client.close();
       if (!closed.ok) throw closed.error;
+      expect(result.error.cleanupFailure?.cleanupIncomplete).toBe(false);
       expect(client.operationHealthSnapshot()).toBeUndefined();
       expect(
         close.mock.contexts.filter((context) => context === owner),
@@ -264,7 +313,189 @@ describe("GhidraClient captured source snapshot", () => {
       close.mockRestore();
     }
   });
+});
 
+describe("GhidraClient snapshot finalization", () => {
+  it("reports exact cancellation after snapshot close (#4752)", async () => {
+    const endpointObservation = mockTcpEndpointObservation();
+    onTestFinished(() => endpointObservation.mockRestore());
+    const client = clientFor(new FixtureLauncher(), {
+      platform: "darwin",
+      transport: "authenticated-loopback-tcp",
+    });
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled during snapshot close");
+    const nativeClose = OwnedFileHandle.prototype.close;
+    let observed: OwnedFileHandle | undefined;
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementationOnce(async function (this: OwnedFileHandle) {
+        observed = this;
+        await nativeClose.call(this);
+        controller.abort(reason);
+      });
+    try {
+      const result = await client.hashTargetSnapshot(controller.signal);
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: "cancelled",
+          cancellation: { reason },
+          cause: {
+            fileCancellation: {
+              outcome: {
+                kind: "completed",
+                value: { sha256: TARGET_SHA256 },
+              },
+            },
+          },
+        },
+      });
+      expect(observed?.handle.fd).toBe(-1);
+    } finally {
+      close.mockRestore();
+    }
+  });
+});
+
+describe("GhidraClient snapshot read failure finalization", () => {
+  it("keeps a failed snapshot read primary when close also fails", async () => {
+    const endpointObservation = mockTcpEndpointObservation();
+    onTestFinished(() => endpointObservation.mockRestore());
+    const client = clientFor(new FixtureLauncher(), {
+      platform: "darwin",
+      transport: "authenticated-loopback-tcp",
+    });
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    const controller = new AbortController();
+    const primary = new Error("snapshot read failed");
+    const closeCause = new Error("snapshot close failed");
+    const nativeOpen = regularFile.openRegularFile;
+    const open = vi
+      .spyOn(regularFile, "openRegularFile")
+      .mockImplementation(async (path, options) => {
+        const handle = await nativeOpen(path, options);
+        vi.spyOn(handle, "read").mockRejectedValueOnce(primary);
+        return handle;
+      });
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockImplementationOnce(async () => {
+        controller.abort("caller stopped");
+        throw closeCause;
+      });
+    try {
+      const result = await client.hashTargetSnapshot(controller.signal);
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: "protocol",
+          cleanupFailure: { cleanupIncomplete: true },
+          cause: {
+            fileCleanupFailure: {
+              outcome: { kind: "failed", cause: primary },
+            },
+          },
+        },
+      });
+    } finally {
+      close.mockRestore();
+      open.mockRestore();
+    }
+    await expect(client.close()).resolves.toMatchObject({ ok: true });
+  });
+});
+
+describe("GhidraClient bounded snapshot finalization", () => {
+  it("preserves bounded-read cancellation when close also fails", async () => {
+    const endpointObservation = mockTcpEndpointObservation();
+    onTestFinished(() => endpointObservation.mockRestore());
+    const client = clientFor(new FixtureLauncher(), {
+      platform: "darwin",
+      transport: "authenticated-loopback-tcp",
+    });
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    const controller = new AbortController();
+    const reason = new Error("caller stopped during bounded snapshot read");
+    const closeCause = new Error("snapshot close failed");
+    const allocate = Buffer.allocUnsafe;
+    const allocations = vi
+      .spyOn(Buffer, "allocUnsafe")
+      .mockImplementationOnce((size) => {
+        controller.abort(reason);
+        return allocate(size);
+      });
+    const close = vi
+      .spyOn(OwnedFileHandle.prototype, "close")
+      .mockRejectedValueOnce(closeCause);
+    try {
+      const result = await client.readTargetSnapshot(
+        undefined,
+        controller.signal,
+      );
+      expect(result).toMatchObject({
+        ok: false,
+        error: {
+          kind: "cancelled",
+          cancellation: { reason },
+          cleanupFailure: { cleanupIncomplete: true },
+        },
+      });
+    } finally {
+      close.mockRestore();
+      allocations.mockRestore();
+    }
+    await expect(client.close()).resolves.toMatchObject({ ok: true });
+  });
+});
+
+describe("GhidraClient snapshot close admission", () => {
+  it("rejects a snapshot read admitted after client cleanup begins", async () => {
+    const endpointObservation = mockTcpEndpointObservation();
+    onTestFinished(() => endpointObservation.mockRestore());
+    const client = clientFor(new FixtureLauncher(), {
+      platform: "darwin",
+      transport: "authenticated-loopback-tcp",
+    });
+    const started = await client.start();
+    if (!started.ok) throw started.error;
+    let releaseRoot: (() => void) | undefined;
+    let enteredRootClose: (() => void) | undefined;
+    const rootCloseEntered = new Promise<void>((resolve) => {
+      enteredRootClose = resolve;
+    });
+    const rootCloseGate = new Promise<void>((resolve) => {
+      releaseRoot = resolve;
+    });
+    const nativeClose = PrivateRuntimeRoot.prototype.close;
+    const rootClose = vi
+      .spyOn(PrivateRuntimeRoot.prototype, "close")
+      .mockImplementation(async function (this: PrivateRuntimeRoot) {
+        enteredRootClose?.();
+        await rootCloseGate;
+        return nativeClose.call(this);
+      });
+    try {
+      const closing = client.close();
+      await rootCloseEntered;
+      await expect(client.hashTargetSnapshot()).resolves.toMatchObject({
+        ok: false,
+        error: { kind: "process", message: "Ghidra session is closing" },
+      });
+      releaseRoot?.();
+      await expect(closing).resolves.toMatchObject({ ok: true });
+    } finally {
+      releaseRoot?.();
+      rootClose.mockRestore();
+    }
+  });
+});
+
+describe("GhidraClient snapshot reads", () => {
   it("hashes complete private snapshots with bounded chunks and abortable reads", async () => {
     const root = await createTestTempDirectory("rea-ghidra-hash-");
     const source = join(root, "firmware.bin");

@@ -1,4 +1,3 @@
-import { regularFileCancellation } from "../filesystem/OwnedRegularFile.js";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import type { Stats } from "node:fs";
 import type { FileHandle } from "node:fs/promises";
@@ -61,17 +60,20 @@ import {
 import { createGhidraTargetSnapshot } from "./GhidraTargetSnapshot.js";
 import { ArtifactResourceScope } from "../artifacts/ArtifactResourceScope.js";
 import { ArtifactReaderFailure } from "../artifacts/ArtifactReader.js";
-import { artifactFileCancellationCause } from "../artifacts/ArtifactFileOperation.js";
+import {
+  ArtifactFileCancelled,
+  ArtifactFileCleanupFailure,
+  artifactFileCancellationCause,
+  assertArtifactReadActive,
+  bindArtifactFileCleanup,
+  withArtifactRegularFile,
+} from "../artifacts/ArtifactFileOperation.js";
 import { readFileHandleChunks } from "../filesystem/readFileHandleChunks.js";
 import { readBoundedFileBytes } from "../process/BoundedFileBytes.js";
 import {
-  openRegularFile,
-  assertRegularFileActive,
   RegularFileChangedError,
-  RegularFileAdmissionFailure,
   sameRegularFileState,
 } from "../filesystem/RegularFile.js";
-import { OwnedFileHandle } from "../filesystem/OwnedFileHandle.js";
 import { redactCapturedTransportCredential } from "../process/ProviderDiagnosticRedaction.js";
 
 export type GhidraTargetSnapshot =
@@ -119,7 +121,6 @@ export class GhidraClient {
   #socketRoot: PrivateRuntimeRoot | undefined;
   #endpointPath: string | undefined;
   #snapshotPath: string | undefined;
-  readonly #snapshotOwners = new Set<OwnedFileHandle>();
   readonly #fileResources = new ArtifactResourceScope();
   readonly #cleanupFailures = new Set<AnalysisError>();
   #targetAdmission: JsonValue | undefined;
@@ -402,7 +403,15 @@ export class GhidraClient {
         maximumBytes ?? initial.size,
         signal,
         initial.size,
-      );
+      ).catch((cause: unknown) => {
+        if (signal?.aborted === true && cause === signal.reason)
+          throw new ArtifactReaderFailure(
+            "cancelled",
+            "Ghidra snapshot reading was cancelled",
+            { cause: signal.reason },
+          );
+        throw cause;
+      });
       if (bytes === undefined || bytes.length !== initial.size)
         throw new RegularFileChangedError(path);
       return { kind: "captured", bytes };
@@ -424,6 +433,12 @@ export class GhidraClient {
       for await (const chunk of readFileHandleChunks(handle, {
         end: initial.size,
         signal,
+        cancellationFailure: (reason) =>
+          new ArtifactReaderFailure(
+            "cancelled",
+            "Ghidra snapshot hashing was cancelled",
+            { cause: reason },
+          ),
       })) {
         bytes += chunk.length;
         if (bytes > initial.size) throw new RegularFileChangedError(path);
@@ -446,60 +461,55 @@ export class GhidraClient {
           "Ghidra target snapshot is unavailable before startup or after close",
         ),
       );
+    if (this.#closing)
+      return err(this.#failure("process", "Ghidra session is closing"));
     try {
-      const handle = await openRegularFile(path, {
-        symlinks: "reject",
-        signal,
-      });
-      const owner = new OwnedFileHandle(handle);
-      this.#snapshotOwners.add(owner);
-      let result: Result<T, unknown>;
-      try {
-        const initial = await handle.stat();
-        assertRegularFileActive(signal);
-        if (!Number.isSafeInteger(initial.size) || initial.size < 0)
-          throw new RangeError("Snapshot size must be a safe integer");
-        const value = await read(handle, initial, path);
-        assertRegularFileActive(signal);
-        const after = await handle.stat();
-        assertRegularFileActive(signal);
-        if (!sameRegularFileState(initial, after))
-          throw new RegularFileChangedError(path);
-        result = ok(value);
-      } catch (cause: unknown) {
-        result = err(cause);
-      }
-      try {
-        await owner.close();
-        this.#snapshotOwners.delete(owner);
-      } catch (closeFailure: unknown) {
-        throw new AggregateError(
-          result.ok ? [closeFailure] : [result.error, closeFailure],
-          "Ghidra target snapshot read or descriptor cleanup failed",
+      const snapshotValue = await this.#fileResources.run(async () => {
+        if (this.#closing)
+          throw this.#failure("process", "Ghidra session is closing");
+        return withArtifactRegularFile(
+          path,
+          this.#fileResources,
+          signal,
+          async (handle) => {
+            const initial = await handle.stat();
+            assertArtifactReadActive(signal);
+            if (!Number.isSafeInteger(initial.size) || initial.size < 0)
+              throw new RangeError("Snapshot size must be a safe integer");
+            const snapshotValue = await read(handle, initial, path);
+            assertArtifactReadActive(signal);
+            const after = await handle.stat();
+            assertArtifactReadActive(signal);
+            if (!sameRegularFileState(initial, after))
+              throw new RegularFileChangedError(path);
+            return snapshotValue;
+          },
+          "reject",
         );
-      }
-      if (!result.ok) throw result.error;
-      return result;
+      });
+      return ok(snapshotValue);
     } catch (cause: unknown) {
-      if (cause instanceof RegularFileAdmissionFailure)
-        this.#snapshotOwners.add(cause.owner);
-      const primary =
-        cause instanceof RegularFileAdmissionFailure ? cause.cause : cause;
-      const cancellation = regularFileCancellation(primary);
-      return err(
-        this.#failure(
-          cancellation !== undefined || signal?.aborted === true
-            ? "cancelled"
-            : "protocol",
-          "Ghidra target snapshot could not be read for load-image verification",
-          cancellation === undefined ||
-            cause instanceof RegularFileAdmissionFailure
-            ? cause
-            : cancellation.reason,
-          cancellation === undefined ? {} : { cancellation },
-        ),
-      );
+      return err(this.#snapshotFailure(cause, signal));
     }
+  }
+
+  #snapshotFailure(cause: unknown, signal?: AbortSignal): GhidraSessionError {
+    if (cause instanceof GhidraSessionError) return cause;
+    const cancellation =
+      snapshotCancellation(cause) ??
+      (signal?.aborted === true && cause === signal.reason
+        ? { reason: signal.reason }
+        : undefined);
+    const failure = this.#failure(
+      cancellation === undefined ? "protocol" : "cancelled",
+      "Ghidra target snapshot could not be read for load-image verification",
+      cause,
+      cancellation === undefined ? {} : { cancellation },
+    );
+    const cleanup = snapshotCleanupFailure(cause);
+    if (cleanup === undefined) return failure;
+    bindArtifactFileCleanup(cause, cleanup);
+    return failure.withCleanupFailure(cleanup);
   }
 
   /** This waiter owns its cancellation reason, independently of shared startup. */
@@ -550,9 +560,6 @@ export class GhidraClient {
         ...(cause instanceof ArtifactReaderFailure
           ? (cause.cleanup?.resources ?? [])
           : []),
-        ...(this.#snapshotOwners.size === 0
-          ? []
-          : [this.#snapshotPath ?? "Ghidra snapshot descriptor"]),
         ...[this.#runtimeRoot, this.#socketRoot].flatMap((root) =>
           root === undefined ? [] : [root.path],
         ),
@@ -688,7 +695,6 @@ export class GhidraClient {
       this.#socket !== undefined ||
       this.#runtimeRoot !== undefined ||
       this.#socketRoot !== undefined ||
-      this.#snapshotOwners.size > 0 ||
       this.#fileResources.hasPending
     );
   }
@@ -997,10 +1003,6 @@ export class GhidraClient {
       this.#process = undefined;
       this.#launch = undefined;
       await this.#fileResources.retryCleanup();
-      for (const owner of this.#snapshotOwners) {
-        await owner.close();
-        this.#snapshotOwners.delete(owner);
-      }
       try {
         await this.#removeRuntimeRoots();
       } catch (cause: unknown) {
@@ -1233,3 +1235,33 @@ export class GhidraClient {
     return this.#outputDrainPromise;
   }
 }
+
+const snapshotCleanupFailure = (
+  cause: unknown,
+): ProviderCleanupError | undefined => {
+  if (!(cause instanceof ArtifactReaderFailure) || cause.cleanup === undefined)
+    return undefined;
+  return new ProviderCleanupError(
+    "ghidra",
+    cause.cleanup.resources,
+    { reason: cause.cleanup.reason },
+    { operation: "read_ghidra_target_snapshot", cause },
+  );
+};
+
+const snapshotCancellation = (
+  cause: unknown,
+): { readonly reason: unknown } | undefined => {
+  if (cause instanceof ArtifactFileCleanupFailure) {
+    if (cause.fileCleanupFailure.outcome.kind === "failed")
+      return snapshotCancellation(cause.fileCleanupFailure.outcome.cause);
+    if (cause.fileCleanupFailure.completionCancellation !== undefined)
+      return cause.fileCleanupFailure.completionCancellation;
+    return undefined;
+  }
+  if (cause instanceof ArtifactFileCancelled)
+    return { reason: artifactFileCancellationCause(cause) };
+  if (cause instanceof ArtifactReaderFailure && cause.reason === "cancelled")
+    return { reason: artifactFileCancellationCause(cause) };
+  return undefined;
+};
